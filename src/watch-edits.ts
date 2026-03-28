@@ -1,3 +1,4 @@
+import { readFileSync } from "fs";
 import { createOpencodeClient, type Event } from "@opencode-ai/sdk";
 
 const port = process.env.OPENCODE_PORT || "4096";
@@ -10,12 +11,52 @@ if (!res.ok) {
   console.error("Failed to connect:", res.status, res.statusText);
   process.exit(1);
 }
-const health = await res.json();
+const health = (await res.json()) as { version: string };
 console.log(`Connected! Server version: ${health.version}\n`);
 console.log("Watching for file edits... (Ctrl+C to stop)\n");
 
 const client = createOpencodeClient({ baseUrl });
 const { stream } = await client.event.subscribe();
+
+function time() {
+  return new Date().toLocaleTimeString();
+}
+
+function findNewStringLines(
+  content: string,
+  newString: string,
+): { start: number; end: number } | null {
+  const idx = content.indexOf(newString);
+  if (idx === -1) return null;
+  const start = content.slice(0, idx).split("\n").length;
+  const end = start + newString.split("\n").length - 1;
+  return { start, end };
+}
+
+function showEdit(filePath: string, newString: string) {
+  try {
+    const content = readFileSync(filePath, "utf-8");
+    const lines = content.split("\n");
+    const loc = findNewStringLines(content, newString);
+    const newLines = newString.split("\n");
+
+    if (loc) {
+      const range = loc.start === loc.end ? `${loc.start}` : `${loc.start}-${loc.end}`;
+      console.log(`[${time()}] ${filePath}:${range} (+${newLines.length} lines)`);
+      for (let i = 0; i < newLines.length; i++) {
+        console.log(`  ${loc.start + i} + ${newLines[i]}`);
+      }
+    } else {
+      console.log(`[${time()}] ${filePath} (+${newLines.length} lines)`);
+      for (const line of newLines) {
+        console.log(`  + ${line}`);
+      }
+    }
+    console.log();
+  } catch {
+    console.log(`[${time()}] ${filePath} (edited)\n`);
+  }
+}
 
 for await (const event of stream) {
   const e = event as Event;
@@ -37,31 +78,9 @@ for await (const event of stream) {
         oldString?: string;
         newString?: string;
       };
-      const time = new Date().toLocaleTimeString();
+      if (!input.filePath || !input.newString) continue;
 
-      if (input.oldString && input.newString) {
-        const oldLines = input.oldString.split("\n");
-        const newLines = input.newString.split("\n");
-        const addedLines = newLines.filter(
-          (line) => !oldLines.includes(line),
-        );
-
-        if (addedLines.length > 0) {
-          console.log(
-            `[${time}] ${input.filePath ?? "?"} (+${addedLines.length} lines)`,
-          );
-          for (const line of addedLines) {
-            console.log(`  + ${line}`);
-          }
-          console.log();
-        }
-      } else if (input.newString) {
-        console.log(`[${time}] ${input.filePath ?? "?"} (new file)`);
-        for (const line of input.newString.split("\n")) {
-          console.log(`  + ${line}`);
-        }
-        console.log();
-      }
+      showEdit(input.filePath, input.newString);
     }
   }
 }
