@@ -1,8 +1,12 @@
-import { readFileSync } from "fs";
 import { createInterface } from "readline";
 import { createOpencodeClient, type Event } from "@opencode-ai/sdk";
+import {
+  type Change,
+  formatEdit,
+  isEditTool,
+  isSessionCompleteEvent,
+} from "./watch-edits-shared";
 
-const EDIT_TOOL_KEYWORDS = ["edit", "write", "file", "patch", "create"] as const;
 const interactive = process.argv.slice(2).some(
   (a) => a === "--interactive" || a === "-i",
 );
@@ -27,99 +31,6 @@ console.log(
 
 const client = createOpencodeClient({ baseUrl });
 const { stream } = await client.event.subscribe();
-
-function time() {
-  return new Date().toLocaleTimeString();
-}
-
-function findNewStringLines(
-  content: string,
-  newString: string,
-): { start: number; end: number } | null {
-  const idx = content.indexOf(newString);
-  if (idx === -1) return null;
-  const start = content.slice(0, idx).split("\n").length;
-  const end = start + newString.split("\n").length - 1;
-  return { start, end };
-}
-
-interface Change {
-  filePath: string;
-  oldString?: string;
-  newString: string;
-}
-
-interface InsertedLines {
-  startOffset: number;
-  lines: string[];
-}
-
-function findInsertedLines(
-  oldString: string | undefined,
-  newString: string,
-): InsertedLines {
-  const newLines = newString.split("\n");
-  if (!oldString) {
-    return { startOffset: 0, lines: newLines };
-  }
-
-  const oldLines = oldString.split("\n");
-  let prefix = 0;
-  while (
-    prefix < oldLines.length &&
-    prefix < newLines.length &&
-    oldLines[prefix] === newLines[prefix]
-  ) {
-    prefix++;
-  }
-
-  let suffix = 0;
-  while (
-    suffix < oldLines.length - prefix &&
-    suffix < newLines.length - prefix &&
-    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
-  ) {
-    suffix++;
-  }
-
-  const insertedLines = newLines.slice(prefix, newLines.length - suffix);
-  return { startOffset: prefix, lines: insertedLines };
-}
-
-function formatEdit(
-  filePath: string,
-  oldString: string | undefined,
-  newString: string,
-): string[] {
-  try {
-    const content = readFileSync(filePath, "utf-8");
-    const loc = findNewStringLines(content, newString);
-    const inserted = findInsertedLines(oldString, newString);
-
-    if (loc && inserted.lines.length > 0) {
-      const start = loc.start + inserted.startOffset;
-      const end = start + inserted.lines.length - 1;
-      const range = start === end ? `${start}` : `${start}-${end}`;
-      return [
-        `[${time()}] ${filePath}:${range} (+${inserted.lines.length} lines)`,
-        ...inserted.lines.map((line, i) => `  ${start + i} + ${line}`),
-      ];
-    }
-
-    if (inserted.lines.length > 0) {
-      return [
-        `[${time()}] ${filePath} (+${inserted.lines.length} lines)`,
-        ...inserted.lines.map((line) => `  + ${line}`),
-      ];
-    }
-
-    return [
-      `[${time()}] ${filePath} (edited)`,
-    ];
-  } catch {
-    return [`[${time()}] ${filePath} (edited)`];
-  }
-}
 
 function showEdit(filePath: string, oldString: string | undefined, newString: string) {
   for (const line of formatEdit(filePath, oldString, newString)) {
@@ -184,26 +95,6 @@ function flushSessionChanges(sessionID: string): void {
   pendingBySession.delete(sessionID);
   reviewQueue.push(changes);
   void reviewLoop();
-}
-
-function isSessionCompleteEvent(event: Event): string | null {
-  if (event.type === "session.idle") {
-    return event.properties.sessionID;
-  }
-
-  if (event.type === "session.error") {
-    return event.properties.sessionID ?? null;
-  }
-
-  if (event.type === "session.status" && event.properties.status.type === "idle") {
-    return event.properties.sessionID;
-  }
-
-  return null;
-}
-
-function isEditTool(toolName: string): boolean {
-  return EDIT_TOOL_KEYWORDS.some((keyword) => toolName.includes(keyword));
 }
 
 for await (const event of stream) {
