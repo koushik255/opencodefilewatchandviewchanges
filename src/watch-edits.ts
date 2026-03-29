@@ -2,6 +2,7 @@ import { readFileSync } from "fs";
 import { createInterface } from "readline";
 import { createOpencodeClient, type Event } from "@opencode-ai/sdk";
 
+const EDIT_TOOL_KEYWORDS = ["edit", "write", "file", "patch", "create"] as const;
 const interactive = process.argv.slice(2).some(
   (a) => a === "--interactive" || a === "-i",
 );
@@ -48,12 +49,15 @@ interface Change {
   newString: string;
 }
 
-interface ChangeBatch {
-  sessionID: string;
-  changes: Change[];
+interface InsertedLines {
+  startOffset: number;
+  lines: string[];
 }
 
-function findInsertedLines(oldString: string | undefined, newString: string) {
+function findInsertedLines(
+  oldString: string | undefined,
+  newString: string,
+): InsertedLines {
   const newLines = newString.split("\n");
   if (!oldString) {
     return { startOffset: 0, lines: newLines };
@@ -125,7 +129,7 @@ function showEdit(filePath: string, oldString: string | undefined, newString: st
 }
 
 const pendingBySession = new Map<string, Change[]>();
-const reviewQueue: ChangeBatch[] = [];
+const reviewQueue: Change[][] = [];
 let isReviewing = false;
 
 async function promptNext(): Promise<void> {
@@ -145,60 +149,70 @@ async function reviewLoop(): Promise<void> {
   if (isReviewing) return;
   isReviewing = true;
 
-  while (reviewQueue.length > 0) {
-    const batch = reviewQueue.shift()!;
-    const batchSize = batch.changes.length;
+  try {
+    while (reviewQueue.length > 0) {
+      const batch = reviewQueue.shift();
+      if (!batch) continue;
 
-    for (let index = 0; index < batch.changes.length; index++) {
-      const change = batch.changes[index]!;
-      const reviewedInBatch = index + 1;
+      for (const [index, change] of batch.entries()) {
+        const reviewedInBatch = index + 1;
+        const batchSize = batch.length;
 
-      console.log(`--- Change ${reviewedInBatch} of ${batchSize} ---`);
-      for (const line of formatEdit(change.filePath, change.oldString, change.newString)) {
-        console.log(line);
+        console.log(`--- Change ${reviewedInBatch} of ${batchSize} ---`);
+        for (const line of formatEdit(change.filePath, change.oldString, change.newString)) {
+          console.log(line);
+        }
+        console.log();
+
+        if (reviewedInBatch >= batchSize) {
+          console.log("That's all.\n");
+          continue;
+        }
+
+        await promptNext();
       }
-      console.log();
-
-      if (reviewedInBatch >= batchSize) {
-        console.log("That's all.\n");
-        continue;
-      }
-
-      await promptNext();
     }
+  } finally {
+    isReviewing = false;
   }
-
-  isReviewing = false;
 }
 
-function flushSessionChanges(sessionID: string) {
+function flushSessionChanges(sessionID: string): void {
   const changes = pendingBySession.get(sessionID);
   if (!changes || changes.length === 0) return;
 
   pendingBySession.delete(sessionID);
-  reviewQueue.push({ sessionID, changes });
+  reviewQueue.push(changes);
   void reviewLoop();
+}
+
+function isSessionCompleteEvent(event: Event): string | null {
+  if (event.type === "session.idle") {
+    return event.properties.sessionID;
+  }
+
+  if (event.type === "session.error") {
+    return event.properties.sessionID ?? null;
+  }
+
+  if (event.type === "session.status" && event.properties.status.type === "idle") {
+    return event.properties.sessionID;
+  }
+
+  return null;
+}
+
+function isEditTool(toolName: string): boolean {
+  return EDIT_TOOL_KEYWORDS.some((keyword) => toolName.includes(keyword));
 }
 
 for await (const event of stream) {
   const e = event as Event;
 
   if (interactive) {
-    if (e.type === "session.idle") {
-      flushSessionChanges(e.properties.sessionID);
-      continue;
-    }
-
-    if (
-      e.type === "session.status" &&
-      e.properties.status.type === "idle"
-    ) {
-      flushSessionChanges(e.properties.sessionID);
-      continue;
-    }
-
-    if (e.type === "session.error" && e.properties.sessionID) {
-      flushSessionChanges(e.properties.sessionID);
+    const sessionID = isSessionCompleteEvent(e);
+    if (sessionID) {
+      flushSessionChanges(sessionID);
       continue;
     }
   }
@@ -206,14 +220,7 @@ for await (const event of stream) {
   if (e.type === "message.part.updated") {
     const part = e.properties.part;
     if (part.type === "tool" && part.state.status === "completed") {
-      const toolName = part.tool;
-      const isEditTool =
-        toolName.includes("edit") ||
-        toolName.includes("write") ||
-        toolName.includes("file") ||
-        toolName.includes("patch") ||
-        toolName.includes("create");
-      if (!isEditTool) continue;
+      if (!isEditTool(part.tool)) continue;
 
       const input = part.state.input as {
         filePath?: string;
@@ -222,16 +229,18 @@ for await (const event of stream) {
       };
       if (!input.filePath || !input.newString) continue;
 
+      const change: Change = {
+        filePath: input.filePath,
+        oldString: input.oldString,
+        newString: input.newString,
+      };
+
       if (interactive) {
         const sessionChanges = pendingBySession.get(part.sessionID) ?? [];
-        sessionChanges.push({
-          filePath: input.filePath,
-          oldString: input.oldString,
-          newString: input.newString,
-        });
+        sessionChanges.push(change);
         pendingBySession.set(part.sessionID, sessionChanges);
       } else {
-        showEdit(input.filePath, input.oldString, input.newString);
+        showEdit(change.filePath, change.oldString, change.newString);
       }
     }
   }
